@@ -801,6 +801,13 @@ Use the following settings to configure the serial connection to the printer:
      additionalPorts:
      - /dev/myPrinterSymlink
 
+     # Use this to define, that ONLY the additional patterns should be used in serial port listings.
+     # Use this setting in the case of parallel octoprint instances on one server, to limit access to 
+     # defined serial ports (e.g. udev generated symlinks)
+     # With this setting you can avoid the situation where a user in one octoprint instance selects 
+     # serial port from a wrong printer and kills a running job.
+     onlyAdditionalPorts: false
+
      # Use this to define additional baud rates to offer for connecting to serial ports. Must be a
      # valid integer. Defaults to not set
      additionalBaudrates:
