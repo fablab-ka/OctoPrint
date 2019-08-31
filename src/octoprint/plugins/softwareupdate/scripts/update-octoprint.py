@@ -29,20 +29,20 @@ def _log(lines, prefix=None, stream=None):
 		output_stream = sys.stderr
 
 	for line in lines:
-		to_print = _to_str(u"{} {}".format(prefix, _to_unicode(line.rstrip(), errors="replace")),
-		                   errors="replace")
+		to_print = _to_bytes(u"{} {}".format(prefix, _to_unicode(line.rstrip(), errors="replace")),
+		                     errors="replace")
 		print(to_print, file=output_stream)
 
 
 def _to_unicode(s_or_u, encoding="utf-8", errors="strict"):
 	"""Make sure ``s_or_u`` is a unicode string."""
-	if isinstance(s_or_u, str):
+	if isinstance(s_or_u, bytes):
 		return s_or_u.decode(encoding, errors=errors)
 	else:
 		return s_or_u
 
 
-def _to_str(s_or_u, encoding="utf-8", errors="strict"):
+def _to_bytes(s_or_u, encoding="utf-8", errors="strict"):
 	"""Make sure ``s_or_u`` is a str."""
 	if isinstance(s_or_u, unicode):
 		return s_or_u.encode(encoding, errors=errors)
@@ -59,7 +59,9 @@ def _execute(command, **kwargs):
 		joined_command = command
 	_log_call(joined_command)
 
-	kwargs.update(dict(async=True, stdout=sarge.Capture(), stderr=sarge.Capture()))
+	kwargs.update(dict(async_=True,
+	                   stdout=sarge.Capture(),
+	                   stderr=sarge.Capture()))
 
 	try:
 		p = sarge.run(command, **kwargs)

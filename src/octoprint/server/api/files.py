@@ -18,6 +18,7 @@ import octoprint.filemanager.util
 import octoprint.filemanager.storage
 import octoprint.slicing
 
+import os
 import psutil
 import hashlib
 import logging
@@ -132,7 +133,7 @@ def readGcodeFilesForOrigin(origin):
 
 
 def _getFileDetails(origin, path, recursive=True):
-	parent, path = fileManager.split_path(origin, path)
+	parent, path = os.path.split(path)
 	files = _getFileList(origin, path=parent, recursive=recursive)
 
 	for f in files:
@@ -335,7 +336,9 @@ def uploadGcodeFile(target):
 			"""
 
 			if destination == FileDestinations.SDCARD and octoprint.filemanager.valid_file_type(filename, "machinecode"):
-				return filename, printer.add_sd_file(filename, absFilename, selectAndOrPrint, tags={"source:api", "api:files.sd"})
+				return filename, printer.add_sd_file(filename, absFilename,
+				                                     on_success=selectAndOrPrint,
+				                                     tags={"source:api", "api:files.sd"})
 			else:
 				selectAndOrPrint(filename, absFilename, destination)
 				return filename
@@ -541,9 +544,10 @@ def gcodeFileCommand(filename, target):
 		if not any([octoprint.filemanager.valid_file_type(filename, type=source_file_type) for source_file_type in slicer_instance.get_slicer_properties().get("source_file_types", ["model"])]):
 			return make_response("Cannot slice {filename}, not a model file".format(**locals()), 415)
 
-		if slicer_instance.get_slicer_properties().get("same_device", True) and (printer.is_printing() or printer.is_paused()):
+		cores = psutil.cpu_count()
+		if slicer_instance.get_slicer_properties().get("same_device", True) and (printer.is_printing() or printer.is_paused()) and (cores is None or cores < 2):
 			# slicer runs on same device as OctoPrint, slicing while printing is hence disabled
-			return make_response("Cannot slice on {slicer} while printing due to performance reasons".format(**locals()), 409)
+			return make_response("Cannot slice on {slicer} while printing on single core systems or systems of unknown core count due to performance reasons".format(**locals()), 409)
 
 		if "destination" in data and data["destination"]:
 			destination = data["destination"]

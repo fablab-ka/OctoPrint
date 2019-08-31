@@ -1,4 +1,4 @@
-# coding=utf-8
+# -*- coding: utf-8 -*-
 from __future__ import absolute_import, division, print_function
 
 """
@@ -24,14 +24,44 @@ import collections
 import frozendict
 import copy
 
+from typing import Union
+
 try:
 	import queue
 except ImportError:
 	import Queue as queue
 
-from past.builtins import basestring
+from past.builtins import basestring, unicode
 
 logger = logging.getLogger(__name__)
+
+
+def to_bytes(s_or_u, encoding="utf-8", errors="strict"):
+	# type: (Union[str, bytes], str, str) -> bytes
+	"""Make sure ``s_or_u`` is a bytestring."""
+	if isinstance(s_or_u, unicode):
+		return s_or_u.encode(encoding, errors=errors)
+	else:
+		return s_or_u
+
+
+def to_unicode(s_or_u, encoding="utf-8", errors="strict"):
+	# type: (Union[str, bytes], str, str) -> str
+	"""Make sure ``s_or_u`` is a unicode string."""
+	if isinstance(s_or_u, bytes):
+		return s_or_u.decode(encoding, errors=errors)
+	else:
+		return s_or_u
+
+
+def to_native_str(s_or_u):
+	# type: (Union[str, bytes]) -> Union[str, bytes]
+	"""Make sure ``s_or_u`` is a 'str'."""
+	if sys.version_info[0] == 2:
+		return to_bytes(s_or_u)
+	else:
+		return to_unicode(s_or_u)
+
 
 def warning_decorator_factory(warning_type):
 	def specific_warning(message, stacklevel=1, since=None, includedoc=None, extenddoc=False):
@@ -99,6 +129,8 @@ Arguments:
 Returns:
     function: The wrapped function with the deprecation warnings in place.
 """
+
+to_str = deprecated("to_str has been renamed to to_bytes", since="1.3.11")(to_bytes)
 
 def get_formatted_size(num):
 	"""
@@ -339,15 +371,15 @@ def find_collision_free_name(filename, extension, existing_filenames, max_power=
 	    u'test_123.gco'
 	    >>> find_collision_free_name("test1234", "g o", [])
 	    u'test1234.g_o'
-	    >>> find_collision_free_name("test12345", "gco", ["test12~1.gco"])
+	    >>> find_collision_free_name("test12345", "gco", ["/test12~1.gco"])
 	    u'test12~2.gco'
-	    >>> many_files = ["test12~{}.gco".format(x) for x in range(10)[1:]]
+	    >>> many_files = ["/test12~{}.gco".format(x) for x in range(10)[1:]]
 	    >>> find_collision_free_name("test12345", "gco", many_files)
 	    u'test1~10.gco'
-	    >>> many_more_files = many_files + ["test1~{}.gco".format(x) for x in range(10, 99)]
+	    >>> many_more_files = many_files + ["/test1~{}.gco".format(x) for x in range(10, 99)]
 	    >>> find_collision_free_name("test12345", "gco", many_more_files)
 	    u'test1~99.gco'
-	    >>> many_more_files_plus_one = many_more_files + ["test1~99.gco"]
+	    >>> many_more_files_plus_one = many_more_files + ["/test1~99.gco"]
 	    >>> find_collision_free_name("test12345", "gco", many_more_files_plus_one)
 	    Traceback (most recent call last):
 	    ...
@@ -357,13 +389,15 @@ def find_collision_free_name(filename, extension, existing_filenames, max_power=
 
 	"""
 
-	if not isinstance(filename, unicode):
-		filename = unicode(filename)
-	if not isinstance(extension, unicode):
-		extension = unicode(extension)
+	filename = to_unicode(filename)
+	extension = to_unicode(extension)
+
+	if filename.startswith(u"/"):
+		filename = filename[1:]
+	existing_filenames = [to_unicode(x[1:] if x.startswith("/") else x) for x in existing_filenames]
 
 	def make_valid(text):
-		return re.sub(r"\s+", "_", text.translate({ord(i):None for i in ".\"/\\[]:;=,"})).lower()
+		return re.sub(u"\s+", u"_", text.translate({ord(i):None for i in ".\"/\\[]:;=,"})).lower()
 
 	filename = make_valid(filename)
 	extension = make_valid(extension)
@@ -425,26 +459,10 @@ def filter_non_ascii(line):
 	"""
 
 	try:
-		to_str(to_unicode(line, encoding="ascii"), encoding="ascii")
+		to_bytes(to_unicode(line, encoding="ascii"), encoding="ascii")
 		return False
 	except ValueError:
 		return True
-
-
-def to_str(s_or_u, encoding="utf-8", errors="strict"):
-	"""Make sure ``s_or_u`` is a str."""
-	if isinstance(s_or_u, unicode):
-		return s_or_u.encode(encoding, errors=errors)
-	else:
-		return s_or_u
-
-
-def to_unicode(s_or_u, encoding="utf-8", errors="strict"):
-	"""Make sure ``s_or_u`` is a unicode string."""
-	if isinstance(s_or_u, str):
-		return s_or_u.decode(encoding, errors=errors)
-	else:
-		return s_or_u
 
 
 def chunks(l, n):
@@ -1268,8 +1286,9 @@ class ResettableTimer(threading.Thread):
 
 class CountedEvent(object):
 
-	def __init__(self, value=0, maximum=None, **kwargs):
+	def __init__(self, value=0, minimum=0, maximum=None, **kwargs):
 		self._counter = 0
+		self._min = minimum
 		self._max = kwargs.get("max", maximum)
 		self._mutex = threading.RLock()
 		self._event = threading.Event()
@@ -1296,11 +1315,14 @@ class CountedEvent(object):
 			else:
 				self._internal_set(self._counter - 1)
 
+	def reset(self):
+		self.clear(completely=True)
+
 	def wait(self, timeout=None):
 		self._event.wait(timeout)
 
 	def blocked(self):
-		return self.counter == 0
+		return self.counter <= 0
 
 	def acquire(self, blocking=1):
 		return self._mutex.acquire(blocking=blocking)
@@ -1311,7 +1333,8 @@ class CountedEvent(object):
 	def _internal_set(self, value):
 		self._counter = value
 		if self._counter <= 0:
-			self._counter = 0
+			if self._min is not None and self._counter < self._min:
+				self._counter = self._min
 			self._event.clear()
 		else:
 			if self._max is not None and self._counter > self._max:
@@ -1591,3 +1614,16 @@ class CaseInsensitiveSet(collections.Set):
 # originally from https://stackoverflow.com/a/5967539
 def natural_key(text):
 	return [ int(c) if c.isdigit() else c for c in re.split("(\d+)", text) ]
+
+
+def timing(f):
+	@wraps(f)
+	def decorator(*args, **kwargs):
+		start = monotonic_time()
+		try:
+			return f(*args, **kwargs)
+		finally:
+			end = monotonic_time()
+			logging.getLogger("octoprint.util.timing").debug("func:{} took {:0.2f}s".format(f.__name__,
+			                                                                                end - start))
+	return decorator

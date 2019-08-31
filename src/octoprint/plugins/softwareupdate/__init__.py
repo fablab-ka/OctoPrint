@@ -8,6 +8,7 @@ __copyright__ = "Copyright (C) 2014 The OctoPrint Project - Released under terms
 
 import octoprint.plugin
 
+import copy
 import flask
 import os
 import threading
@@ -26,7 +27,14 @@ from flask_babel import gettext
 from octoprint.server.util.flask import restricted_access, with_revalidation_checking, check_etag
 from octoprint.server import admin_permission, VERSION, REVISION, BRANCH
 from octoprint.util import dict_merge, to_unicode
+from octoprint.util.version import get_comparable_version, get_python_version_string
+from octoprint.util.pip import LocalPipCaller
 import octoprint.settings
+
+
+MINIMUM_PYTHON = "2.7.9"
+MINIMUM_SETUPTOOLS = "5.5.1"
+MINIMUM_PIP = "9.0.1"
 
 
 ##~~ Plugin
@@ -42,7 +50,7 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 
 	COMMIT_TRACKING_TYPES = ("github_commit", "bitbucket_commit")
 
-	DATA_FORMAT_VERSION = "v3"
+	DATA_FORMAT_VERSION = "v4"
 
 	# noinspection PyMissingConstructor
 	def __init__(self):
@@ -60,6 +68,10 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		self._version_cache_path = None
 		self._version_cache_dirty = False
 		self._version_cache_timestamp = None
+
+		self._environment_supported = True
+		self._environment_versions = dict()
+		self._environment_ready = threading.Event()
 
 		self._console_logger = None
 
@@ -87,14 +99,8 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		self._console_logger.propagate = False
 
 	def on_after_startup(self):
-		# refresh cache now if necessary so it's faster once the user connects to the instance - but decouple it from
-		# the server startup
-		def fetch_data():
-			self.get_current_versions()
-
-		thread = threading.Thread(target=fetch_data)
-		thread.daemon = True
-		thread.start()
+		self._check_environment()
+		self.get_current_versions()
 
 	def _get_configured_checks(self):
 		with self._configured_checks_mutex:
@@ -104,13 +110,18 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 
 				update_check_hooks = self._plugin_manager.get_hooks("octoprint.plugin.softwareupdate.check_config")
 				check_providers = self._settings.get(["check_providers"], merged=True)
+				if not isinstance(check_providers, dict):
+					check_providers = dict()
+
 				effective_configs = dict()
 
 				for name, hook in update_check_hooks.items():
 					try:
 						hook_checks = hook()
 					except:
-						self._logger.exception("Error while retrieving update information from plugin {name}".format(**locals()))
+						self._logger.exception("Error while retrieving update information "
+						                       "from plugin {name}".format(**locals()),
+						                       extra=dict(plugin=name))
 					else:
 						for key, default_config in hook_checks.items():
 							if key in effective_configs or key == "octoprint":
@@ -163,6 +174,23 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 					del self._configured_checks[key]
 
 			return self._configured_checks
+
+	def _check_environment(self):
+		import pkg_resources
+
+		local_pip = LocalPipCaller()
+
+		# check python and setuptools version
+		versions = dict(python=get_python_version_string(),
+		                setuptools=pkg_resources.get_distribution("setuptools").version,
+		                pip=local_pip.version_string)
+		supported = get_comparable_version(versions["python"]) >= get_comparable_version(MINIMUM_PYTHON) \
+		       and get_comparable_version(versions["setuptools"]) >= get_comparable_version(MINIMUM_SETUPTOOLS) \
+		       and get_comparable_version(versions["pip"]) >= get_comparable_version(MINIMUM_PIP)
+
+		self._environment_supported = supported
+		self._environment_versions = versions
+		self._environment_ready.set()
 
 	def _load_version_cache(self):
 		if not os.path.isfile(self._version_cache_path):
@@ -482,11 +510,17 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		force = flask.request.values.get("force", "false") in octoprint.settings.valid_boolean_trues
 
 		def view():
+			self._environment_ready.wait(timeout=30.0)
+
 			try:
 				information, update_available, update_possible = self.get_current_versions(check_targets=check_targets, force=force)
-				return flask.jsonify(dict(status="inProgress" if self._update_in_progress else "updatePossible" if update_available and update_possible else "updateAvailable" if update_available else "current",
+				return flask.jsonify(dict(status="inProgress" if self._update_in_progress else "updatePossible" if update_available and update_possible and self._environment_supported else "updateAvailable" if update_available else "current",
 				                          information=information,
-				                          timestamp=self._version_cache_timestamp))
+				                          timestamp=self._version_cache_timestamp,
+				                          environment=dict(supported=self._environment_supported,
+				                                           versions=[dict(name=gettext("Python"), current=self._environment_versions.get("python", "unknown"), minimum=MINIMUM_PYTHON),
+				                                                     dict(name=gettext("pip"), current=self._environment_versions.get("pip", "unknown"), minimum=MINIMUM_PIP),
+				                                                     dict(name=gettext("setuptools"), current=self._environment_versions.get("setuptools", "unknown"), minimum=MINIMUM_SETUPTOOLS)])))
 			except exceptions.ConfigurationInvalid as e:
 				return flask.make_response("Update not properly configured, can't proceed: %s" % e.message, 500)
 
@@ -513,6 +547,8 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 					hash.update(str(data.get("online", None)))
 
 			hash.update(",".join(targets))
+
+			hash.update(str(self._environment_supported))
 			hash.update(str(self._version_cache_timestamp))
 			hash.update(str(self._connectivity_checker.online))
 			hash.update(str(self._update_in_progress))
@@ -534,6 +570,9 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		if self._printer.is_printing() or self._printer.is_paused():
 			# do not update while a print job is running
 			return flask.make_response("Printer is currently printing or paused", 409)
+
+		if not self._environment_supported:
+			return flask.make_response("Direct updates are not supported in this Python environment", 409)
 
 		if not "application/json" in flask.request.headers["Content-Type"]:
 			return flask.make_response("Expected content-type JSON", 400)
@@ -559,6 +598,7 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		return dict(
 			css=["css/softwareupdate.css"],
 			js=["js/softwareupdate.js"],
+			clientjs=["clientjs/softwareupdate.js"],
 			less=["less/softwareupdate.less"]
 		)
 
@@ -645,6 +685,7 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 							continue
 
 						target_information, target_update_available, target_update_possible, target_online, target_error = future.result()
+						target_update_possible = target_update_possible and self._environment_supported
 
 						target_information = dict_merge(dict(local=dict(name="?", value="?"),
 						                                     remote=dict(name="?", value="?",
@@ -778,6 +819,10 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		:param targets: an iterable defining the targets to update, if not supplied defaults to all targets
 		"""
 
+		if not self._environment_supported:
+			self._logger.error("Direct updates are unsupported in this environment")
+			return [], dict()
+
 		targets = kwargs.get("targets", kwargs.get("check_targets", None))
 
 		checks = self._get_configured_checks()
@@ -897,6 +942,24 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		# determine the target version to update to
 		target_version = information["remote"]["value"]
 		target_error = False
+		target_result = None
+
+		def trigger_event(success, **additional_payload):
+			from octoprint.events import Events
+
+			if success:
+				# noinspection PyUnresolvedReferences
+				event = Events.PLUGIN_SOFTWAREUPDATE_UPDATE_SUCCEEDED
+			else:
+				# noinspection PyUnresolvedReferences
+				event = Events.PLUGIN_SOFTWAREUPDATE_UPDATE_FAILED
+
+			payload = copy.copy(additional_payload)
+			payload.update(dict(target=target,
+			                    from_version=information["local"]["value"],
+			                    to_version=target_version))
+
+			self._event_bus.fire(event, payload=payload)
 
 		### The actual update procedure starts here...
 
@@ -911,6 +974,7 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 			update_result = updater.perform_update(target, populated_check, target_version, log_cb=self._log, online=online)
 			target_result = ("success", update_result)
 			self._logger.info("Update of %s to %s successful!" % (target, target_version))
+			trigger_event(True)
 
 		except exceptions.UnknownUpdateType:
 			self._logger.warn("Update of %s can not be performed, unknown update type" % target)
@@ -923,6 +987,8 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 
 		except Exception as e:
 			self._logger.exception("Update of %s can not be performed, please also check plugin_softwareupdate_console.log for possible causes of this" % target)
+			trigger_event(False)
+
 			if not "ignorable" in populated_check or not populated_check["ignorable"]:
 				target_error = True
 
@@ -960,7 +1026,7 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 
 		self._logger.info("Restarting...")
 		try:
-			util.execute(restart_command, evaluate_returncode=False, async=True)
+			util.execute(restart_command, evaluate_returncode=False, do_async=True)
 		except exceptions.ScriptError as e:
 			self._logger.exception("Error while restarting via command {}".format(restart_command))
 			self._logger.warn("Restart stdout:\n{}".format(e.stdout))
@@ -1137,6 +1203,10 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		return None
 
 
+def _register_custom_events(*args, **kwargs):
+	return ["update_succeeded", "update_failed"]
+
+
 __plugin_name__ = "Software Update"
 __plugin_author__ = "Gina Häußge"
 __plugin_url__ = "http://docs.octoprint.org/en/master/bundledplugins/softwareupdate.html"
@@ -1159,7 +1229,8 @@ def __plugin_load__():
 
 	global __plugin_hooks__
 	__plugin_hooks__ = {
-		"octoprint.cli.commands": cli.commands
+		"octoprint.cli.commands": cli.commands,
+		"octoprint.events.register_custom_events": _register_custom_events
 	}
 
 

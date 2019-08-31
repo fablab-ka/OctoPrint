@@ -194,8 +194,20 @@ class DiscoveryPlugin(octoprint.plugin.StartupPlugin,
 			params["txtRecord"] = pybonjour.TXTRecord(txt_record)
 
 		key = (reg_type, port)
-		self._sd_refs[key] = pybonjour.DNSServiceRegister(**params)
-		self._logger.info(u"Registered {name} for {reg_type}".format(**locals()))
+
+		counter = 1
+		while True:
+			try:
+				self._sd_refs[key] = pybonjour.DNSServiceRegister(**params)
+				self._logger.info(u"Registered '{name}' for {regtype}".format(**params))
+				return True
+			except pybonjour.BonjourError as be:
+				if be.errorCode == pybonjour.kDNSServiceErr_NameConflict:
+					# Name already registered by different service, let's try a counter postfix. See #2852
+					counter += 1
+					params["name"] = u"{} ({})".format(name, counter)
+				else:
+					raise
 
 	def zeroconf_unregister(self, reg_type, port=None):
 		"""
@@ -550,9 +562,8 @@ class DiscoveryPlugin(octoprint.plugin.StartupPlugin,
 		"""
 
 		import socket
-		import time
 
-		if alive and self._ssdp_last_notify + self._ssdp_notify_timeout > time.time():
+		if alive and self._ssdp_last_notify + self._ssdp_notify_timeout > octoprint.util.monotonic_time():
 			# we just sent an alive, no need to send another one now
 			return
 
@@ -591,7 +602,7 @@ class DiscoveryPlugin(octoprint.plugin.StartupPlugin,
 			except:
 				pass
 
-		self._ssdp_last_notify = time.time()
+		self._ssdp_last_notify = octoprint.util.monotonic_time()
 
 	def _ssdp_monitor(self, timeout=5):
 		"""
@@ -601,8 +612,14 @@ class DiscoveryPlugin(octoprint.plugin.StartupPlugin,
 		                alive message
 		"""
 
-		from BaseHTTPServer import BaseHTTPRequestHandler
-		from StringIO import StringIO
+		try:
+			# noinspection PyCompatibility
+			from http.server import BaseHTTPRequestHandler
+		except ImportError:
+			# noinspection PyCompatibility
+			from BaseHTTPServer import BaseHTTPRequestHandler
+
+		from io import BytesIO
 		import socket
 
 		socket.setdefaulttimeout(timeout)
@@ -617,8 +634,9 @@ class DiscoveryPlugin(octoprint.plugin.StartupPlugin,
 
 		class Request(BaseHTTPRequestHandler):
 
+			# noinspection PyMissingConstructor
 			def __init__(self, request_text):
-				self.rfile = StringIO(request_text)
+				self.rfile = BytesIO(request_text)
 				self.raw_requestline = self.rfile.readline()
 				self.error_code = self.error_message = None
 				self.parse_request()

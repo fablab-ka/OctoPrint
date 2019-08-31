@@ -21,6 +21,7 @@ import octoprint.util as util
 
 from octoprint.settings import settings
 from octoprint.events import eventManager, Events
+from octoprint.plugin import plugin_manager
 from octoprint.util import monotonic_time
 
 import sarge
@@ -60,6 +61,32 @@ _cleanup_lock = threading.RLock()
 # lock for timelapse job
 _job_lock = threading.RLock()
 
+# cached valid timelapse extensions
+_extensions = None
+
+def valid_timelapse(path):
+	global _extensions
+
+	if _extensions is None:
+		# create list of extensions
+		extensions = ["mpg", "mpeg", "mp4", "m4v", "mkv"]
+
+		hooks = plugin_manager().get_hooks("octoprint.timelapse.extensions")
+		for name, hook in hooks.items():
+			try:
+				result = hook()
+				if result is None or not isinstance(result, list):
+					continue
+				extensions += result
+			except:
+				logging.getLogger(__name__).exception("Exception while retrieving additional timelapse "
+				                                      "extensions from hook {name}".format(name=name),
+				                                      extra=dict(plugin=name))
+
+		_extensions = list(set(extensions))
+
+	return util.is_allowed_file(path, _extensions)
+
 
 def _extract_prefix(filename):
 	"""
@@ -86,7 +113,7 @@ def get_finished_timelapses():
 	files = []
 	basedir = settings().getBaseFolder("timelapse", check_writable=False)
 	for entry in scandir(basedir):
-		if not fnmatch.fnmatch(entry.name, "*.m*"):
+		if util.is_hidden_path(entry.path) or not valid_timelapse(entry.path):
 			continue
 		files.append({
 			"name": entry.name,
@@ -291,24 +318,16 @@ def configure_timelapse(config=None, persist=False):
 
 	snapshot_url = settings().get(["webcam", "snapshot"])
 	ffmpeg_path = settings().get(["webcam", "ffmpeg"])
+	timelapse_enabled = settings().getBoolean(["webcam", "timelapseEnabled"])
 	timelapse_precondition = snapshot_url is not None and snapshot_url.strip() != "" \
 	                         and ffmpeg_path is not None and ffmpeg_path.strip() != ""
 
 	type = config["type"]
-	if not timelapse_precondition and type is not None and type != "off":
+	if not timelapse_precondition and timelapse_precondition:
 		logging.getLogger(__name__).warn("Essential timelapse settings unconfigured (snapshot URL or FFMPEG path) "
-		                                 "but timelapse enabled, forcing disabled timelapse and disabling it "
-		                                 "in the config as well.")
-		type = "off"
-		config["type"] = "off"
+		                                 "but timelapse enabled.")
 
-		if not persist:
-			# make sure we persist at least that timelapse is now disabled by default - we don't want the above
-			# warning to log
-			settings().set(["webcam", "timelapse", "type"], "off")
-			settings().save()
-
-	if type is None or "off" == type:
+	if not timelapse_enabled or not timelapse_precondition or type is None or "off" == type:
 		current = None
 
 	else:
@@ -360,7 +379,6 @@ class Timelapse(object):
 		self._capture_success = 0
 
 		self._post_roll = post_roll
-		self._post_roll_start = None
 		self._on_post_roll_done = None
 
 		self._capture_dir = settings().getBaseFolder("timelapse_tmp")
@@ -511,7 +529,6 @@ class Timelapse(object):
 				                    dict(postroll_duration=self.calculate_post_roll(),
 				                         postroll_length=self.post_roll,
 				                         postroll_fps=self.fps))
-				self._post_roll_start = time.time()
 				if do_create_movie:
 					self._on_post_roll_done = create_wait_for_captures(reset_and_create)
 				else:
@@ -519,7 +536,6 @@ class Timelapse(object):
 				self.process_post_roll()
 			else:
 				# no post roll? perfect, render
-				self._post_roll_start = None
 				if do_create_movie:
 					wait_for_captures(reset_and_create)
 				else:

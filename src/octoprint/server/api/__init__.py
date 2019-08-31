@@ -7,20 +7,20 @@ __copyright__ = "Copyright (C) 2014 The OctoPrint Project - Released under terms
 
 import logging
 import netaddr
-import sarge
 
 from flask import Blueprint, request, jsonify, abort, current_app, session, make_response, g
 from flask_login import login_user, logout_user, current_user
 from flask_principal import Identity, identity_changed, AnonymousIdentity
 
 import octoprint.util as util
+import octoprint.util.net as util_net
 import octoprint.users
 import octoprint.server
 import octoprint.plugin
 from octoprint.server import admin_permission, NO_CONTENT
 from octoprint.settings import settings as s, valid_boolean_trues
-from octoprint.server.util import noCachingExceptGetResponseHandler, enforceApiKeyRequestHandler, loginFromApiKeyRequestHandler, loginFromAuthorizationHeaderRequestHandler, corsRequestHandler, corsResponseHandler
-from octoprint.server.util.flask import restricted_access, get_json_command_from_request, passive_login
+from octoprint.server.util import noCachingExceptGetResponseHandler, loginFromApiKeyRequestHandler, loginFromAuthorizationHeaderRequestHandler, corsRequestHandler, corsResponseHandler
+from octoprint.server.util.flask import restricted_access, get_json_command_from_request, passive_login, get_remote_address
 
 
 #~~ init api blueprint, including sub modules
@@ -45,7 +45,6 @@ VERSION = "0.1"
 api.after_request(noCachingExceptGetResponseHandler)
 
 api.before_request(corsRequestHandler)
-api.before_request(enforceApiKeyRequestHandler)
 api.before_request(loginFromAuthorizationHeaderRequestHandler)
 api.before_request(loginFromApiKeyRequestHandler)
 api.after_request(corsResponseHandler)
@@ -61,15 +60,20 @@ def pluginData(name):
 	if len(api_plugins) > 1:
 		return make_response("More than one api provider registered for {name}, can't proceed".format(name=name), 500)
 
-	api_plugin = api_plugins[0]
-	if api_plugin.is_api_adminonly() and not current_user.is_admin():
-		return make_response("Forbidden", 403)
+	try:
+		api_plugin = api_plugins[0]
+		if api_plugin.is_api_adminonly() and not current_user.is_admin():
+			return make_response("Forbidden", 403)
 
-	response = api_plugin.on_api_get(request)
+		response = api_plugin.on_api_get(request)
 
-	if response is not None:
-		return response
-	return NO_CONTENT
+		if response is not None:
+			return response
+		return NO_CONTENT
+	except Exception:
+		logging.getLogger(__name__).exception("Error calling SimpleApiPlugin {}".format(name),
+		                                      extra=dict(plugin=name))
+		return abort(500)
 
 #~~ commands for plugins
 
@@ -85,21 +89,26 @@ def pluginCommand(name):
 		return make_response("More than one api provider registered for {name}, can't proceed".format(name=name), 500)
 
 	api_plugin = api_plugins[0]
-	valid_commands = api_plugin.get_api_commands()
-	if valid_commands is None:
-		return make_response("Method not allowed", 405)
+	try:
+		valid_commands = api_plugin.get_api_commands()
+		if valid_commands is None:
+			return make_response("Method not allowed", 405)
 
-	if api_plugin.is_api_adminonly() and not current_user.is_admin():
-		return make_response("Forbidden", 403)
+		if api_plugin.is_api_adminonly() and not current_user.is_admin():
+			return make_response("Forbidden", 403)
 
-	command, data, response = get_json_command_from_request(request, valid_commands)
-	if response is not None:
-		return response
+		command, data, response = get_json_command_from_request(request, valid_commands)
+		if response is not None:
+			return response
 
-	response = api_plugin.on_api_command(command, data)
-	if response is not None:
-		return response
-	return NO_CONTENT
+		response = api_plugin.on_api_command(command, data)
+		if response is not None:
+			return response
+		return NO_CONTENT
+	except Exception:
+		logging.getLogger(__name__).exception("Error while excuting SimpleApiPlugin {}".format(name),
+		                                      extra=dict(plugin=name))
+		return abort(500)
 
 #~~ first run setup
 
@@ -120,7 +129,9 @@ def wizardState():
 			version = implementation.get_wizard_version()
 			ignored = octoprint.plugin.WizardPlugin.is_wizard_ignored(seen_wizards, implementation)
 		except:
-			logging.getLogger(__name__).exception("There was an error fetching wizard details for {}, ignoring".format(name))
+			logging.getLogger(__name__).exception("There was an error fetching wizard "
+			                                      "details for {}, ignoring".format(name),
+			                                      extra=dict(plugin=name))
 		else:
 			result[name] = dict(required=required, details=details, version=version, ignored=ignored)
 
@@ -155,7 +166,9 @@ def wizardFinish():
 			if name in handled:
 				seen_wizards[name] = implementation.get_wizard_version()
 		except:
-			logging.getLogger(__name__).exception("There was an error finishing the wizard for {}, ignoring".format(name))
+			logging.getLogger(__name__).exception("There was an error finishing the "
+			                                      "wizard for {}, ignoring".format(name),
+			                                      extra=dict(plugin=name))
 
 	s().set(["server", "seenWizards"], seen_wizards)
 	s().save()
@@ -177,7 +190,8 @@ def apiPrinterState():
 def apiVersion():
 	return jsonify({
 		"server": octoprint.server.VERSION,
-		"api": VERSION
+		"api": VERSION,
+		"text": "OctoPrint {}".format(octoprint.server.DISPLAY_VERSION)
 	})
 
 
@@ -214,7 +228,16 @@ def login():
 					g.user = user
 				login_user(user, remember=remember)
 				identity_changed.send(current_app._get_current_object(), identity=Identity(user.get_id()))
-				return jsonify(user.asDict())
+
+				remote_addr = get_remote_address(request)
+				logging.getLogger(__name__).info("Actively logging in user {} from {}".format(user.get_id(), remote_addr))
+
+				response = user.asDict()
+				response["_is_external_client"] = s().getBoolean(["server", "ipCheck", "enabled"]) \
+				                                  and not util_net.is_lan_address(remote_addr,
+				                                                                  additional_private=s().get(["server", "ipCheck", "trustedSubnets"]))
+				return jsonify(response)
+
 		return make_response(("User unknown or password incorrect", 401, []))
 
 	elif "passive" in data:
