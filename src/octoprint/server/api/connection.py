@@ -47,7 +47,7 @@ def connectionCommand():
 		printerProfile = None
 		if "port" in data.keys():
 			port = data["port"]
-			if port not in connection_options["ports"] and port != "AUTO":
+			if port not in connection_options["ports"] :
 				return make_response("Invalid port: %s" % port, 400)
 		if "baudrate" in data.keys():
 			baudrate = data["baudrate"]
